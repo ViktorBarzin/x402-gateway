@@ -233,10 +233,11 @@ func (c *config) callFacilitator(ctx context.Context, payment string, req *http.
 	return nil
 }
 
-// notifyPayment fires a fire-and-forget POST to NOTIFY_WEBHOOK_URL with a
-// summary of a successful payment so the operator gets a real-time ping
-// (e.g., to ntfy / Slack). Failures are logged at WARN and never block the
-// request.
+// notifyPayment fires a fire-and-forget POST to NOTIFY_WEBHOOK_URL on every
+// successful payment. Payload is Slack-incoming-webhook compatible
+// ({"text": "...", "username": "...", "icon_emoji": "..."}); auxiliary
+// fields are ignored by Slack but useful for richer receivers. Failures
+// are logged at WARN and never block the request.
 func (c *config) notifyPayment(req *http.Request) {
 	if c.notifyWebhookURL == "" {
 		return
@@ -249,7 +250,15 @@ func (c *config) notifyPayment(req *http.Request) {
 	if xfu := req.Header.Get("X-Forwarded-Uri"); xfu != "" {
 		uri = xfu
 	}
+	ua := truncate(req.Header.Get("User-Agent"), 80)
+	text := fmt.Sprintf(":moneybag: *x402 payment* %s received on `%s%s` — UA `%s` — wallet `%s` (%s)",
+		c.priceLabel, host, uri, ua, c.wallet, c.network)
+
 	body := map[string]interface{}{
+		"text":       text,
+		"username":   "x402-gateway",
+		"icon_emoji": ":moneybag:",
+		// Auxiliary fields — Slack ignores, structured receivers can parse.
 		"event":     "payment_received",
 		"host":      host,
 		"path":      uri,
@@ -269,23 +278,15 @@ func (c *config) notifyPayment(req *http.Request) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		// Render a short human-friendly message — most ntfy clients show this
-		// as the body, while still parsing JSON if the receiver wants it.
-		title := fmt.Sprintf("x402 payment %s on %s", c.priceLabel, host)
-		message := fmt.Sprintf("%s %s — UA: %s", req.Method, uri, truncate(req.Header.Get("User-Agent"), 80))
 		hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.notifyWebhookURL, bytes.NewReader(buf))
 		if err != nil {
 			slog.Warn("notify: request build failed", "error", err.Error())
 			return
 		}
 		hreq.Header.Set("Content-Type", "application/json")
-		// ntfy convention: Title / Tags / Priority via headers, body = message.
-		hreq.Header.Set("Title", title)
-		hreq.Header.Set("Tags", "moneybag,robot")
-		hreq.Header.Set("X-Message", message)
 		resp, err := http.DefaultClient.Do(hreq)
 		if err != nil {
-			slog.Warn("notify: POST failed", "error", err.Error(), "url", c.notifyWebhookURL)
+			slog.Warn("notify: POST failed", "error", err.Error())
 			return
 		}
 		_ = resp.Body.Close()
