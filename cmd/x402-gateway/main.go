@@ -51,18 +51,19 @@ const (
 )
 
 type config struct {
-	bind           string
-	metricsBind    string
-	mode           string // "proxy" (legacy per-site) or "forwardauth" (shared via Traefik)
-	target         *url.URL
-	wallet         string
-	priceUSDC      uint64 // amount in USDC base units (6 decimals)
-	priceLabel     string // "$0.01" for display
-	network        string
-	facilitatorURL string
-	usdcAsset      string
-	dryRun         bool
-	botUARegex     *regexp.Regexp
+	bind             string
+	metricsBind      string
+	mode             string // "proxy" (legacy per-site) or "forwardauth" (shared via Traefik)
+	target           *url.URL
+	wallet           string
+	priceUSDC        uint64 // amount in USDC base units (6 decimals)
+	priceLabel       string // "$0.01" for display
+	network          string
+	facilitatorURL   string
+	usdcAsset        string
+	dryRun           bool
+	botUARegex       *regexp.Regexp
+	notifyWebhookURL string // optional — POSTed to on every successful payment
 }
 
 type paymentRequirements struct {
@@ -95,13 +96,14 @@ var (
 
 func loadConfig() (*config, error) {
 	c := &config{
-		bind:           getEnv("BIND", ":8923"),
-		metricsBind:    getEnv("METRICS_BIND", ":9090"),
-		mode:           getEnv("MODE", "proxy"),
-		wallet:         os.Getenv("WALLET_ADDRESS"),
-		network:        getEnv("NETWORK", "base"),
-		facilitatorURL: getEnv("FACILITATOR_URL", "https://x402.org/facilitator"),
-		priceLabel:     getEnv("PRICE_LABEL", "$0.01"),
+		bind:             getEnv("BIND", ":8923"),
+		metricsBind:      getEnv("METRICS_BIND", ":9090"),
+		mode:             getEnv("MODE", "proxy"),
+		wallet:           os.Getenv("WALLET_ADDRESS"),
+		network:          getEnv("NETWORK", "base"),
+		facilitatorURL:   getEnv("FACILITATOR_URL", "https://x402.org/facilitator"),
+		priceLabel:       getEnv("PRICE_LABEL", "$0.01"),
+		notifyWebhookURL: os.Getenv("NOTIFY_WEBHOOK_URL"),
 	}
 	if c.mode != "proxy" && c.mode != "forwardauth" {
 		return nil, fmt.Errorf("MODE must be \"proxy\" or \"forwardauth\", got %q", c.mode)
@@ -231,6 +233,75 @@ func (c *config) callFacilitator(ctx context.Context, payment string, req *http.
 	return nil
 }
 
+// notifyPayment fires a fire-and-forget POST to NOTIFY_WEBHOOK_URL with a
+// summary of a successful payment so the operator gets a real-time ping
+// (e.g., to ntfy / Slack). Failures are logged at WARN and never block the
+// request.
+func (c *config) notifyPayment(req *http.Request) {
+	if c.notifyWebhookURL == "" {
+		return
+	}
+	host := req.Host
+	if xfh := req.Header.Get("X-Forwarded-Host"); xfh != "" {
+		host = xfh
+	}
+	uri := req.URL.Path
+	if xfu := req.Header.Get("X-Forwarded-Uri"); xfu != "" {
+		uri = xfu
+	}
+	body := map[string]interface{}{
+		"event":     "payment_received",
+		"host":      host,
+		"path":      uri,
+		"ua":        req.Header.Get("User-Agent"),
+		"price":     c.priceLabel,
+		"amount":    strconv.FormatUint(c.priceUSDC, 10),
+		"asset":     c.usdcAsset,
+		"network":   c.network,
+		"wallet":    c.wallet,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+	go func() {
+		buf, err := json.Marshal(body)
+		if err != nil {
+			slog.Warn("notify: marshal failed", "error", err.Error())
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// Render a short human-friendly message — most ntfy clients show this
+		// as the body, while still parsing JSON if the receiver wants it.
+		title := fmt.Sprintf("x402 payment %s on %s", c.priceLabel, host)
+		message := fmt.Sprintf("%s %s — UA: %s", req.Method, uri, truncate(req.Header.Get("User-Agent"), 80))
+		hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.notifyWebhookURL, bytes.NewReader(buf))
+		if err != nil {
+			slog.Warn("notify: request build failed", "error", err.Error())
+			return
+		}
+		hreq.Header.Set("Content-Type", "application/json")
+		// ntfy convention: Title / Tags / Priority via headers, body = message.
+		hreq.Header.Set("Title", title)
+		hreq.Header.Set("Tags", "moneybag,robot")
+		hreq.Header.Set("X-Message", message)
+		resp, err := http.DefaultClient.Do(hreq)
+		if err != nil {
+			slog.Warn("notify: POST failed", "error", err.Error(), "url", c.notifyWebhookURL)
+			return
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			slog.Warn("notify: webhook returned non-2xx", "status", resp.StatusCode)
+		}
+	}()
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
 // decision evaluates the x402 logic without writing the response. Returns
 // true when the upstream should be reached (transparent forward / valid
 // payment), false when the caller should issue 402.
@@ -269,6 +340,7 @@ func (c *config) proxyHandler(reverse *httputil.ReverseProxy) http.Handler {
 		switch reason {
 		case "payment_valid":
 			mPaid.Add(1)
+			c.notifyPayment(req)
 		default:
 			mForwarded.Add(1)
 		}
@@ -304,6 +376,7 @@ func (c *config) forwardAuthHandler() http.Handler {
 		switch reason {
 		case "payment_valid":
 			mPaid.Add(1)
+			c.notifyPayment(req)
 		default:
 			mForwarded.Add(1)
 		}
