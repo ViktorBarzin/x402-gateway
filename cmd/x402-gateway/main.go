@@ -53,6 +53,7 @@ const (
 type config struct {
 	bind           string
 	metricsBind    string
+	mode           string // "proxy" (legacy per-site) or "forwardauth" (shared via Traefik)
 	target         *url.URL
 	wallet         string
 	priceUSDC      uint64 // amount in USDC base units (6 decimals)
@@ -96,20 +97,26 @@ func loadConfig() (*config, error) {
 	c := &config{
 		bind:           getEnv("BIND", ":8923"),
 		metricsBind:    getEnv("METRICS_BIND", ":9090"),
+		mode:           getEnv("MODE", "proxy"),
 		wallet:         os.Getenv("WALLET_ADDRESS"),
 		network:        getEnv("NETWORK", "base"),
 		facilitatorURL: getEnv("FACILITATOR_URL", "https://x402.org/facilitator"),
 		priceLabel:     getEnv("PRICE_LABEL", "$0.01"),
 	}
-	rawTarget := os.Getenv("TARGET")
-	if rawTarget == "" {
-		return nil, fmt.Errorf("TARGET env var is required")
+	if c.mode != "proxy" && c.mode != "forwardauth" {
+		return nil, fmt.Errorf("MODE must be \"proxy\" or \"forwardauth\", got %q", c.mode)
 	}
-	t, err := url.Parse(rawTarget)
-	if err != nil {
-		return nil, fmt.Errorf("TARGET is not a valid URL: %w", err)
+	if c.mode == "proxy" {
+		rawTarget := os.Getenv("TARGET")
+		if rawTarget == "" {
+			return nil, fmt.Errorf("TARGET env var is required in proxy mode")
+		}
+		t, err := url.Parse(rawTarget)
+		if err != nil {
+			return nil, fmt.Errorf("TARGET is not a valid URL: %w", err)
+		}
+		c.target = t
 	}
-	c.target = t
 
 	priceMicros, err := strconv.ParseUint(getEnv("PRICE_USDC_MICROS", "10000"), 10, 64)
 	if err != nil {
@@ -224,54 +231,84 @@ func (c *config) callFacilitator(ctx context.Context, payment string, req *http.
 	return nil
 }
 
-func (c *config) handler(reverse *httputil.ReverseProxy) http.Handler {
+// decision evaluates the x402 logic without writing the response. Returns
+// true when the upstream should be reached (transparent forward / valid
+// payment), false when the caller should issue 402.
+func (c *config) decision(req *http.Request) (allow bool, reason string) {
+	if c.dryRun {
+		return true, "dry_run"
+	}
+	if payment := req.Header.Get("X-PAYMENT"); payment != "" {
+		if len(payment) > maxPaymentBodyBytes {
+			return false, "X-PAYMENT exceeds size limit"
+		}
+		ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+		defer cancel()
+		if err := c.callFacilitator(ctx, payment, req); err != nil {
+			return false, fmt.Sprintf("payment rejected: %v", err)
+		}
+		return true, "payment_valid"
+	}
+	if c.botUARegex.MatchString(req.Header.Get("User-Agent")) {
+		return false, "AI/automated client detected — payment required to continue"
+	}
+	return true, "forward"
+}
+
+// proxyHandler — legacy per-site mode: x402 is the inline reverse proxy.
+func (c *config) proxyHandler(reverse *httputil.ReverseProxy) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		// In DRY_RUN we are a transparent proxy — useful while wallet is unset
-		// so that the pod can be deployed into the request path with zero
-		// behavioural impact.
-		if c.dryRun {
-			mForwarded.Add(1)
-			reverse.ServeHTTP(w, req)
+		allow, reason := c.decision(req)
+		if !allow {
+			c.writePaymentRequired(w, req, reason)
+			if strings.HasPrefix(reason, "payment rejected") || strings.HasPrefix(reason, "X-PAYMENT") {
+				mPayInvalid.Add(1)
+			}
 			return
 		}
-
-		// Path 1: client presented a payment.
-		if payment := req.Header.Get("X-PAYMENT"); payment != "" {
-			if len(payment) > maxPaymentBodyBytes {
-				c.writePaymentRequired(w, req, "X-PAYMENT exceeds size limit")
-				mPayInvalid.Add(1)
-				return
-			}
-			ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
-			defer cancel()
-			if err := c.callFacilitator(ctx, payment, req); err != nil {
-				slog.Warn("payment validation failed",
-					"error", err.Error(),
-					"path", req.URL.Path,
-					"ua", req.Header.Get("User-Agent"))
-				c.writePaymentRequired(w, req, fmt.Sprintf("payment rejected: %v", err))
-				mPayInvalid.Add(1)
-				return
-			}
+		switch reason {
+		case "payment_valid":
 			mPaid.Add(1)
-			reverse.ServeHTTP(w, req)
-			return
+		default:
+			mForwarded.Add(1)
 		}
-
-		// Path 2: declared AI-bot UA without payment → 402.
-		ua := req.Header.Get("User-Agent")
-		if c.botUARegex.MatchString(ua) {
-			slog.Info("AI bot UA without payment — issuing 402",
-				"path", req.URL.Path,
-				"ua", ua,
-				"host", req.Host)
-			c.writePaymentRequired(w, req, "AI/automated client detected — payment required to continue")
-			return
-		}
-
-		// Path 3: everything else (browsers, curl, search engines) → forward.
-		mForwarded.Add(1)
 		reverse.ServeHTTP(w, req)
+	})
+}
+
+// forwardAuthHandler — Traefik forwardAuth mode: gateway runs as a sidecar
+// in the traefik namespace and Traefik calls /auth on every request. We
+// answer 200 (allow) or 402 (with payment requirements). Traefik passes
+// the 402 body to the original client unchanged.
+func (c *config) forwardAuthHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Traefik forwards the original Host as `X-Forwarded-Host`. Use it for
+		// `resource:` in payment requirements so a single pod handles all hosts
+		// without per-host config. Path comes from `X-Forwarded-Uri`.
+		if xfh := req.Header.Get("X-Forwarded-Host"); xfh != "" {
+			req.Host = xfh
+		}
+		if xfu := req.Header.Get("X-Forwarded-Uri"); xfu != "" {
+			if u, err := url.ParseRequestURI(xfu); err == nil {
+				req.URL.Path = u.Path
+			}
+		}
+		allow, reason := c.decision(req)
+		if !allow {
+			c.writePaymentRequired(w, req, reason)
+			if strings.HasPrefix(reason, "payment rejected") || strings.HasPrefix(reason, "X-PAYMENT") {
+				mPayInvalid.Add(1)
+			}
+			return
+		}
+		switch reason {
+		case "payment_valid":
+			mPaid.Add(1)
+		default:
+			mForwarded.Add(1)
+		}
+		// 200 with empty body = continue to upstream.
+		w.WriteHeader(http.StatusOK)
 	})
 }
 
@@ -305,34 +342,43 @@ func main() {
 		slog.Error("config load failed", "error", err.Error())
 		os.Exit(1)
 	}
-	slog.Info("starting up x402-gateway",
+	logFields := []any{
 		"bind", cfg.bind,
-		"target", cfg.target.String(),
+		"mode", cfg.mode,
 		"network", cfg.network,
 		"price", cfg.priceLabel,
 		"price_micros", cfg.priceUSDC,
 		"facilitator", cfg.facilitatorURL,
 		"wallet_set", cfg.wallet != "",
-		"dry_run", cfg.dryRun)
-
-	reverse := httputil.NewSingleHostReverseProxy(cfg.target)
-	reverse.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		slog.Warn("upstream error", "target", cfg.target.String(), "error", err.Error())
-		mUpstreamErr.Add(1)
-		http.Error(rw, "upstream unavailable", http.StatusBadGateway)
+		"dry_run", cfg.dryRun,
 	}
-	// Preserve Host so the upstream sees the original viktorbarzin.me-style host.
-	origDirector := reverse.Director
-	reverse.Director = func(req *http.Request) {
-		origDirector(req)
-		req.Host = req.Header.Get("X-Forwarded-Host")
-		if req.Host == "" {
-			req.Host = req.URL.Host
-		}
+	if cfg.target != nil {
+		logFields = append(logFields, "target", cfg.target.String())
 	}
+	slog.Info("starting up x402-gateway", logFields...)
 
 	mux := http.NewServeMux()
-	mux.Handle("/", cfg.handler(reverse))
+	switch cfg.mode {
+	case "proxy":
+		reverse := httputil.NewSingleHostReverseProxy(cfg.target)
+		reverse.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+			slog.Warn("upstream error", "target", cfg.target.String(), "error", err.Error())
+			mUpstreamErr.Add(1)
+			http.Error(rw, "upstream unavailable", http.StatusBadGateway)
+		}
+		origDirector := reverse.Director
+		reverse.Director = func(req *http.Request) {
+			origDirector(req)
+			req.Host = req.Header.Get("X-Forwarded-Host")
+			if req.Host == "" {
+				req.Host = req.URL.Host
+			}
+		}
+		mux.Handle("/", cfg.proxyHandler(reverse))
+	case "forwardauth":
+		// Traefik calls /auth (or any path); we accept all and decide.
+		mux.Handle("/", cfg.forwardAuthHandler())
+	}
 	go func() {
 		mmux := http.NewServeMux()
 		mmux.Handle("/metrics", metricsHandler())
