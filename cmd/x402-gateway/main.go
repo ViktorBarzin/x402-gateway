@@ -5,15 +5,15 @@
 //
 // Behaviour:
 //
-//	1. Health/metrics endpoints are served locally on a separate port.
-//	2. If the request carries an X-PAYMENT header, we ask the configured
-//	   facilitator to verify+settle it. On success we forward to the upstream
-//	   and propagate the response. On failure we return 402 with a fresh
-//	   PaymentRequiredResponse.
-//	3. If the request does NOT carry X-PAYMENT and the User-Agent matches the
-//	   AI-bot regex, we return 402 with PaymentRequiredResponse.
-//	4. Otherwise we forward transparently — Anubis handles the JS PoW gate
-//	   for browsers, raw-curl, etc.
+//  1. Health/metrics endpoints are served locally on a separate port.
+//  2. If the request carries an X-PAYMENT header, we ask the configured
+//     facilitator to verify+settle it. On success we forward to the upstream
+//     and propagate the response. On failure we return 402 with a fresh
+//     PaymentRequiredResponse.
+//  3. If the request does NOT carry X-PAYMENT and the User-Agent matches the
+//     AI-bot regex, we return 402 with PaymentRequiredResponse.
+//  4. Otherwise we forward transparently — Anubis handles the JS PoW gate
+//     for browsers, raw-curl, etc.
 //
 // In DRY_RUN mode (the default while WALLET_ADDRESS is empty) step 2/3 are
 // SKIPPED — every request is forwarded transparently. This lets us deploy the
@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -63,7 +64,8 @@ type config struct {
 	usdcAsset        string
 	dryRun           bool
 	botUARegex       *regexp.Regexp
-	notifyWebhookURL string // optional — POSTed to on every successful payment
+	trustedNets      []*net.IPNet // TRUSTED_CIDRS — sources that skip the bot-UA check
+	notifyWebhookURL string       // optional — POSTed to on every successful payment
 }
 
 type paymentRequirements struct {
@@ -154,7 +156,58 @@ func loadConfig() (*config, error) {
 	}
 	c.botUARegex = rx
 
+	nets, err := parseTrustedCIDRs(os.Getenv("TRUSTED_CIDRS"))
+	if err != nil {
+		return nil, fmt.Errorf("TRUSTED_CIDRS: %w", err)
+	}
+	c.trustedNets = nets
+
 	return c, nil
+}
+
+// parseTrustedCIDRs parses a comma-separated CIDR list. Empty entries are
+// skipped so a trailing comma is harmless, but a malformed CIDR is a hard error
+// rather than a silently-dropped range — a typo here would quietly re-challenge
+// every local client instead of failing visibly.
+func parseTrustedCIDRs(raw string) ([]*net.IPNet, error) {
+	var nets []*net.IPNet
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		_, ipNet, err := net.ParseCIDR(part)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not a CIDR: %w", part, err)
+		}
+		nets = append(nets, ipNet)
+	}
+	return nets, nil
+}
+
+// isTrustedLocal reports whether the request came from a source we treat as
+// local. It reads X-Real-Ip, which the vendored Traefik real-ip plugin
+// overwrites with the unspoofable TCP peer for every peer outside the pod CIDR
+// before this gateway is consulted — so a client cannot forge its way in by
+// sending the header itself. A missing or malformed value is never trusted.
+//
+// Mirrors the trusted_local_cidrs list in the homelab's anubis_instance
+// Terraform module; the two are deployed from different places and must be
+// changed together.
+func (c *config) isTrustedLocal(req *http.Request) bool {
+	if len(c.trustedNets) == 0 {
+		return false
+	}
+	ip := net.ParseIP(strings.TrimSpace(req.Header.Get("X-Real-Ip")))
+	if ip == nil {
+		return false
+	}
+	for _, n := range c.trustedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func getEnv(k, def string) string {
@@ -320,6 +373,13 @@ func (c *config) decision(req *http.Request) (allow bool, reason string) {
 			return false, fmt.Sprintf("payment rejected: %v", err)
 		}
 		return true, "payment_valid"
+	}
+	// Local traffic is never asked to pay. Our own browsing and our own
+	// automation (scripts, headless browsers, in-cluster probes) present UAs the
+	// regex below is built to charge for, so without this the local bypass ends
+	// at Anubis and every local script gets a 402 instead of the app.
+	if c.isTrustedLocal(req) {
+		return true, "trusted_local"
 	}
 	if c.botUARegex.MatchString(req.Header.Get("User-Agent")) {
 		return false, "AI/automated client detected — payment required to continue"
